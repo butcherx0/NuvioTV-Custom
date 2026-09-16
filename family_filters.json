@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "imdb_id": "tt37287335",
+      "title": "Obsession",
+      "year": 2025,
+      "media_type": "movie",
+      "runtime_minutes": 108,
+      "intervals": [
+        {
+          "start": 2703.0,
+          "end": 2722.0,
+          "type": "sex",
+          "action": "skip",
+          "confidence": 0.95,
+          "severity": "high",
+          "source_note": "Verified source timing 00:45:05-00:45:20 with 2s pre/post safety padding"
+        },
+        {
+          "start": 5832.0,
+          "end": 5844.0,
+          "type": "nudity",
+          "action": "skip",
+          "confidence": 0.95,
+          "severity": "high",
+          "source_note": "Verified source timing 01:37:14-01:37:22 with 2s pre/post safety padding"
+        }
+      ]
+    }
+  ]
+}
