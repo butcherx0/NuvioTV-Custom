@@ -65,7 +65,6 @@ class SkipIntroRepository @Inject constructor(
         if (!settings.skipIntroEnabled) return emptyList()
 
         val sources = selectedSources(settings.skipSourcePolicy, settings.skipEnabledSources)
-        if (sources.isEmpty()) return emptyList()
         val categoryKey = settings.skipEnabledSegmentTypes.map { it.storedValue }.sorted().joinToString(",")
         val key = listOf(
             normalizedId, season, episode, mediaType.orEmpty(),
@@ -80,7 +79,7 @@ class SkipIntroRepository @Inject constructor(
         val isSeries = mediaType?.lowercase(Locale.US) in setOf("series", "tv", "show") ||
             (season > 0 && episode > 0)
         val fetched = coroutineScope {
-            sources.map { source ->
+            val providerFetches = sources.map { source ->
                 async {
                     withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
                         runCatching {
@@ -107,7 +106,18 @@ class SkipIntroRepository @Inject constructor(
                         }
                     } ?: emptyList()
                 }
-            }.awaitAll().flatten()
+            }
+            val familyOverrideFetch = async {
+                withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
+                    runCatching {
+                        fetchFromFamilyOverrides(normalizedId, season, episode, isSeries)
+                    }.getOrElse { error ->
+                        Log.d(TAG, "familyfilters: ${error.message ?: "unavailable"}")
+                        emptyList()
+                    }
+                } ?: emptyList()
+            }
+            providerFetches.awaitAll().flatten() + familyOverrideFetch.await()
         }
         val filtered = fetched
             .filter {
@@ -211,6 +221,21 @@ class SkipIntroRepository @Inject constructor(
         return getText(url)?.let(SkipMetadataParser::parseMovieHaven).orEmpty()
     }
 
+    /**
+     * Small remotely-maintained family-filter override database for titles that
+     * are missing from the public skip providers. Keeping the data in GitHub
+     * means timing corrections and new titles do not require a new APK.
+     */
+    private suspend fun fetchFromFamilyOverrides(
+        imdbId: String,
+        season: Int,
+        episode: Int,
+        isSeries: Boolean
+    ): List<SkipInterval> {
+        val raw = getText(FAMILY_FILTERS_URL, MAX_SKIP_FILE_BYTES) ?: return emptyList()
+        return SkipMetadataParser.parseFamilyOverrides(raw, imdbId, season, episode, isSeries)
+    }
+
     private suspend fun fetchFromVideoSkip(
         imdbId: String,
         title: String?,
@@ -287,6 +312,8 @@ class SkipIntroRepository @Inject constructor(
         const val MAX_VIDEO_SKIP_DOWNLOADS = 6
         const val MAX_RESPONSE_BYTES = 2L * 1024L * 1024L
         const val MAX_SKIP_FILE_BYTES = 2L * 1024L * 1024L
+        const val FAMILY_FILTERS_URL =
+            "https://raw.githubusercontent.com/butcherx0/NuvioTV-Custom/main/family_filters.json"
     }
 }
 
@@ -420,6 +447,50 @@ internal object SkipMetadataParser {
                         scene.optString("severity").takeIf { it.isNotBlank() }
                     )
                 )
+            }
+        }
+    }.getOrDefault(emptyList())
+
+    fun parseFamilyOverrides(
+        raw: String,
+        imdbId: String,
+        season: Int,
+        episode: Int,
+        isSeries: Boolean
+    ): List<SkipInterval> = runCatching {
+        val items = JSONObject(raw).optJSONArray("items") ?: JSONArray()
+        buildList {
+            for (itemIndex in 0 until items.length()) {
+                val item = items.optJSONObject(itemIndex) ?: continue
+                if (!item.optString("imdb_id").equals(imdbId, ignoreCase = true)) continue
+
+                val itemMediaType = item.optString("media_type", "movie").lowercase(Locale.US)
+                if (isSeries) {
+                    if (itemMediaType !in setOf("series", "tv", "show")) continue
+                    if (item.optInt("season", -1) != season || item.optInt("episode", -1) != episode) continue
+                } else if (itemMediaType in setOf("series", "tv", "show")) {
+                    continue
+                }
+
+                val intervals = item.optJSONArray("intervals") ?: continue
+                for (intervalIndex in 0 until intervals.length()) {
+                    val interval = intervals.optJSONObject(intervalIndex) ?: continue
+                    val start = interval.optDouble("start", Double.NaN)
+                    val end = interval.optDouble("end", Double.NaN)
+                    if (!start.isFinite() || !end.isFinite() || end <= start) continue
+                    val type = mapCategory(interval.optString("type", "custom"))
+                    add(
+                        SkipInterval(
+                            startTime = start,
+                            endTime = end,
+                            type = type,
+                            provider = "familyfilters",
+                            action = interval.optString("action", "skip").ifBlank { "skip" },
+                            confidence = interval.optDouble("confidence", 0.95).coerceIn(0.0, 1.0),
+                            severity = interval.optString("severity").takeIf { it.isNotBlank() }
+                        )
+                    )
+                }
             }
         }
     }.getOrDefault(emptyList())
