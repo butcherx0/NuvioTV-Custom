@@ -1,0 +1,161 @@
+name: Nuvio Family Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/family-filter-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nuvio-family-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Nuvio Family ARM64
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure official Nuvio Cloud connection
+        shell: bash
+        run: |
+          cat > local.properties <<'EOF'
+          NUVIO_SUPABASE_URL=https://api.nuvio.tv
+          NUVIO_SUPABASE_ANON_KEY=sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xUUC_EN
+          NUVIO_SUPABASE_FALLBACK_URL=
+          AVATAR_PUBLIC_BASE_URL=https://api.nuvio.tv/storage/v1/object/public/avatars
+          TV_LOGIN_WEB_BASE_URL=https://nuvio.tv/tv-login
+          EOF
+
+      - name: Patch family filter fallback and diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          repo = Path('app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt')
+          obs = Path('app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt')
+
+          s = repo.read_text()
+
+          old = '''        mediaType: String? = null,\n        durationMs: Long? = null\n    ): List<SkipInterval> {\n        val normalizedId = imdbId?.trim()?.takeIf { it.matches(Regex("tt\\\\d+")) } ?: return emptyList()'''
+          new = '''        mediaType: String? = null,\n        durationMs: Long? = null,\n        year: String? = null\n    ): List<SkipInterval> {\n        val normalizedId = imdbId\n            ?.let { Regex("tt\\\\d+", RegexOption.IGNORE_CASE).find(it)?.value?.lowercase(Locale.US) }'''
+          if old not in s:
+              raise SystemExit('Patch failed: getSkipIntervals signature/IMDb normalization block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''        val key = listOf(\n            normalizedId, season, episode, mediaType.orEmpty(),\n            settings.skipSourcePolicy.name, sources.joinToString { it.storedValue }, categoryKey,'''
+          new = '''        val key = listOf(\n            normalizedId ?: "no-imdb", title.orEmpty().lowercase(Locale.US), year.orEmpty(),\n            season, episode, mediaType.orEmpty(),\n            settings.skipSourcePolicy.name, sources.joinToString { it.storedValue }, categoryKey,'''
+          if old not in s:
+              raise SystemExit('Patch failed: cache key block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''            val providerFetches = sources.map { source ->\n                async {\n                    withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {'''
+          new = '''            val providerFetches = if (normalizedId == null) {\n                emptyList()\n            } else sources.map { source ->\n                async {\n                    withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {'''
+          if old not in s:
+              raise SystemExit('Patch failed: provider fetch block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''                        fetchFromFamilyOverrides(normalizedId, season, episode, isSeries)'''
+          new = '''                        fetchFromFamilyOverrides(\n                            imdbId = normalizedId,\n                            title = title,\n                            year = year,\n                            season = season,\n                            episode = episode,\n                            isSeries = isSeries\n                        )'''
+          if old not in s:
+              raise SystemExit('Patch failed: family override call not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    private suspend fun fetchFromFamilyOverrides(\n        imdbId: String,\n        season: Int,\n        episode: Int,\n        isSeries: Boolean\n    ): List<SkipInterval> {\n        val raw = getText(FAMILY_FILTERS_URL, MAX_SKIP_FILE_BYTES) ?: return emptyList()\n        return SkipMetadataParser.parseFamilyOverrides(raw, imdbId, season, episode, isSeries)\n    }'''
+          new = '''    private suspend fun fetchFromFamilyOverrides(\n        imdbId: String?,\n        title: String?,\n        year: String?,\n        season: Int,\n        episode: Int,\n        isSeries: Boolean\n    ): List<SkipInterval> {\n        val raw = getText(FAMILY_FILTERS_URL, MAX_SKIP_FILE_BYTES) ?: return emptyList()\n        return SkipMetadataParser.parseFamilyOverrides(\n            raw = raw,\n            imdbId = imdbId,\n            title = title,\n            year = year,\n            season = season,\n            episode = episode,\n            isSeries = isSeries\n        )\n    }'''
+          if old not in s:
+              raise SystemExit('Patch failed: fetchFromFamilyOverrides function not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    fun parseFamilyOverrides(\n        raw: String,\n        imdbId: String,\n        season: Int,\n        episode: Int,\n        isSeries: Boolean\n    ): List<SkipInterval> = runCatching {\n        val items = JSONObject(raw).optJSONArray("items") ?: JSONArray()\n        buildList {\n            for (itemIndex in 0 until items.length()) {\n                val item = items.optJSONObject(itemIndex) ?: continue\n                if (!item.optString("imdb_id").equals(imdbId, ignoreCase = true)) continue\n\n                val itemMediaType = item.optString("media_type", "movie").lowercase(Locale.US)'''
+          new = '''    fun parseFamilyOverrides(\n        raw: String,\n        imdbId: String?,\n        title: String?,\n        year: String?,\n        season: Int,\n        episode: Int,\n        isSeries: Boolean\n    ): List<SkipInterval> = runCatching {\n        val items = JSONObject(raw).optJSONArray("items") ?: JSONArray()\n        val requestedTitle = normalizeFamilyTitle(title)\n        buildList {\n            for (itemIndex in 0 until items.length()) {\n                val item = items.optJSONObject(itemIndex) ?: continue\n\n                val imdbMatches = !imdbId.isNullOrBlank() &&\n                    item.optString("imdb_id").equals(imdbId, ignoreCase = true)\n                val itemYear = item.optInt("year", 0).takeIf { it > 0 }\n                val requestedYear = year?.trim()?.toIntOrNull()\n                val titleYearMatches = requestedTitle.isNotBlank() &&\n                    normalizeFamilyTitle(item.optString("title")) == requestedTitle &&\n                    (requestedYear == null || itemYear == null || itemYear == requestedYear)\n                if (!imdbMatches && !titleYearMatches) continue\n\n                val itemMediaType = item.optString("media_type", "movie").lowercase(Locale.US)'''
+          if old not in s:
+              raise SystemExit('Patch failed: parseFamilyOverrides header not found')
+          s = s.replace(old, new, 1)
+
+          marker = '''    fun parseVideoSkip(raw: String, provider: String = "videoskip"): List<SkipInterval> {'''
+          helper = '''    private fun normalizeFamilyTitle(value: String?): String =\n        value.orEmpty()\n            .lowercase(Locale.US)\n            .replace(Regex("[^\\\\p{L}\\\\p{N}]+"), " ")\n            .trim()\n\n'''
+          if marker not in s:
+              raise SystemExit('Patch failed: parseVideoSkip marker not found')
+          s = s.replace(marker, helper + marker, 1)
+
+          repo.write_text(s)
+
+          p = obs.read_text()
+          p = p.replace(
+              '''    if (id.isNullOrBlank()) return\n\n    val isSeries''',
+              '''    if (id.isNullOrBlank() && currentVideoId.isNullOrBlank() && title.isBlank()) return\n\n    val isSeries''',
+              1
+          )
+
+          old = '''        val candidates = listOfNotNull(\n            currentVideoId?.takeIf { it.isNotBlank() },\n            id.takeIf { it.isNotBlank() }\n        )'''
+          new = '''        val candidates = listOfNotNull(\n            currentVideoId?.takeIf { it.isNotBlank() },\n            id?.takeIf { it.isNotBlank() }\n        )'''
+          if old not in p:
+              raise SystemExit('Patch failed: ID candidates block not found')
+          p = p.replace(old, new, 1)
+
+          old = '''        if (imdbId.isNullOrBlank()) {\n            Log.d(PlayerRuntimeController.TAG, "Skip lookup skipped: no IMDb/TMDB ID for $candidates")\n            return@launch\n        }\n\n        val key = "$imdbId:${season ?: 0}:${episode ?: 0}:$skipSettingsFingerprint"'''
+          new = '''        if (imdbId.isNullOrBlank()) {\n            Log.i(\n                PlayerRuntimeController.TAG,\n                "Skip lookup: no IMDb/TMDB ID for $candidates; using family title/year fallback"\n            )\n        }\n\n        val lookupTitle = currentEpisodeTitle ?: title\n        val key = "${imdbId ?: "no-imdb"}:${lookupTitle}:${year.orEmpty()}:" +\n            "${season ?: 0}:${episode ?: 0}:$skipSettingsFingerprint"'''
+          if old not in p:
+              raise SystemExit('Patch failed: IMDb give-up block not found')
+          p = p.replace(old, new, 1)
+
+          old = '''                title = currentEpisodeTitle ?: title,\n                mediaType = contentType\n            )'''
+          new = '''                title = lookupTitle,\n                mediaType = contentType,\n                year = year\n            )'''
+          if old not in p:
+              raise SystemExit('Patch failed: skip repository call not found')
+          p = p.replace(old, new, 1)
+
+          toast_anchor = '''        // The nt4 capture could not answer why the next-episode card fired at'''
+          toast = '''        val familyFilterCount = skipIntervals.count { it.provider == "familyfilters" }\n        if (familyFilterCount > 0) {\n            android.widget.Toast.makeText(\n                context,\n                "Family Filter: $familyFilterCount scene${if (familyFilterCount == 1) "" else "s"} loaded",\n                android.widget.Toast.LENGTH_LONG\n            ).show()\n        }\n\n'''
+          if toast_anchor not in p:
+              raise SystemExit('Patch failed: diagnostics anchor not found')
+          p = p.replace(toast_anchor, toast + toast_anchor, 1)
+
+          old = '''private fun extractImdbId(value: String): String? =\n    value.substringBefore(':').substringBefore('/').trim()\n        .takeIf { it.matches(Regex("tt\\\\d+")) }'''
+          new = '''private fun extractImdbId(value: String): String? =\n    Regex("tt\\\\d+", RegexOption.IGNORE_CASE)\n        .find(value)\n        ?.value\n        ?.lowercase()'''
+          if old not in p:
+              raise SystemExit('Patch failed: extractImdbId helper not found')
+          p = p.replace(old, new, 1)
+
+          obs.write_text(p)
+
+          print('Family-filter patch applied successfully.')
+          PY
+
+      - name: Verify official cloud and family filter patch
+        shell: bash
+        run: |
+          grep -q 'NUVIO_SUPABASE_URL=https://api.nuvio.tv' local.properties
+          grep -q 'using family title/year fallback' app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+          grep -q 'Family Filter:' app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+          grep -q 'normalizeFamilyTitle' app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt
+
+      - name: Compile benchmark APK
+        run: ./gradlew :app:assembleFullBenchmark --no-daemon --stacktrace
+
+      - name: Upload ARM64 APK only
+        uses: actions/upload-artifact@v6
+        with:
+          name: nuvio-family-arm64-${{ github.sha }}
+          path: app/build/outputs/apk/full/benchmark/app-full-arm64-v8a-benchmark.apk
+          if-no-files-found: error
+          retention-days: 14
