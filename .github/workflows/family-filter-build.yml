@@ -156,6 +156,6 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: nuvio-family-arm64-${{ github.sha }}
-          path: app/build/outputs/apk/full/benchmark/app-full-arm64-v8a-benchmark.apk
+          path: app/build/outputs/apk/full/benchmark/app-full-universal-benchmark.apk
           if-no-files-found: error
           retention-days: 14
